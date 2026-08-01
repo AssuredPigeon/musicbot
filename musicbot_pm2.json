@@ -1,0 +1,13 @@
+{
+  "name": "discord-musicbot",
+  "script": "main.py",
+  "cwd": "/home/opc/musicbot/musicbot",
+  "interpreter": "/home/opc/bot-env/bin/python",
+  "interpreter_args": "",
+  "autorestart": true,
+  "watch": false,
+  "max_memory_restart": "1G",
+  "env": {
+    "PYTHONUNBUFFERED": "1"
+  }
+}

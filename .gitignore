@@ -1,0 +1,83 @@
+# ============================================================
+#  MusicBot - .gitignore
+# ============================================================
+
+# --- Variables de entorno y secretos ---
+.env
+*.env
+!.env.example
+
+# --- Cookies (pueden contener sesiones activas) ---
+cookies.txt
+
+# --- Base de datos ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Archivos temporales del bot ---
+temp_audio/
+*.mp3
+*.wav
+*.ogg
+
+# --- Modelos de IA (son muy pesados) ---
+models/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Entornos virtuales ---
+.venv/
+venv/
+env/
+ENV/
+.env.local
+.env.*.local
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDEs y editores ---
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# --- PM2 (si tienes el ecosistema con datos sensibles) ---
+# musicbot_pm2.json  # Descomenta si contiene datos sensibles
+
+# --- Archivos comprimidos de desarrollo ---
+*.zip
+
+# --- Scripts: sí se incluyen en el repo ---
+# scripts/refresh_cookies.sh NO tiene secretos; el usuario configura
+# SERVER_HOST y SERVER_USER localmente antes de ejecutarlo.
+# Si quieres ignorar tus cambios locales al script:
+# git update-index --skip-worktree scripts/refresh_cookies.sh
