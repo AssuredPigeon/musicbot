@@ -55,6 +55,13 @@ async def on_ready():
     except Exception as e:
         log_exception("Error al cargar extensiones", e)
 
+    # Cargar modulo de traduccion (separado del music bot)
+    try:
+        await bot.load_extension("translator.commands")
+        logger.info("Modulo de traduccion cargado correctamente")
+    except Exception as e:
+        log_exception("Error al cargar el modulo de traduccion", e)
+
     # Establecer estado/actividad
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening, 

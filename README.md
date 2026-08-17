@@ -11,6 +11,7 @@ A production-ready Discord bot that lets users control music playback through **
 - [Features](#features)
 - [Architecture](#architecture)
 - [Voice Command Pipeline](#voice-command-pipeline)
+- [Real-Time Translation](#real-time-translation)
 - [Technical Challenges](#technical-challenges)
 - [Getting Started](#getting-started)
 - [Commands](#commands)
@@ -31,7 +32,9 @@ A production-ready Discord bot that lets users control music playback through **
 | Listening history | Per-user history stored in SQLite |
 | Recommendations | Personalized suggestions based on listening patterns |
 | LRU audio cache | Reduces repeated downloads, lowers playback latency |
-| Multi-server | Each guild gets its own queue and voice session |
+| Real-time translation | Speak in any language, output translated speech & text embed |
+| Adaptive learning | Learns user vocabulary & slang over time (Whisper prompts + glossary) |
+| Multi-server | Each guild gets its own queue, voice session & translation state |
 | Dockerized | Reproducible deployments on Oracle Cloud via PM2 |
 
 ---
@@ -104,6 +107,33 @@ The end-to-end flow when a user speaks in a Discord voice channel:
 | OpenAI API (whisper-1) | `WHISPER_USE_API=true` + key | Pay per use | Yes |
 
 The API mode automatically falls back to local Whisper if the API call fails.
+
+---
+
+## Real-Time Translation
+
+The bot includes an isolated, real-time voice translation module (`translator/`) allowing multi-lingual users in the same voice channel to communicate seamlessly.
+
+```
+User speaks (Language A)
+         |
+TranslatorAudioSink (VAD captures voice segment)
+         |
+Whisper STT (Auto-detects language + uses user speech history as initial prompt)
+         |
+Google Translate via deep-translator (Applies pre- & post-translation user glossary)
+         |
+edge-tts (Synthesizes speech in target language with natural neural voices)
+         |
+Discord VoiceClient plays translated audio + sends text embed summary
+```
+
+### Key Capabilities & Adaptive Learning
+
+- **Zero-cost Stack**: Uses local Whisper (STT) + `deep-translator` (Google Translate) + `edge-tts` (Microsoft Edge 400+ neural voices). No external paid API keys required.
+- **Dynamic Context Prompting**: Builds a dynamic Whisper `initial_prompt` from the user's past speech history, biasing transcription toward their specific vocabulary, gaming terms, and accent.
+- **Personalized Glossary**: Users can add custom term overrides (`/translate glossary_add`). Glossary rules are applied pre-translation (fixing bad inputs) and post-translation (enforcing preferred outputs).
+- **Per-User Isolation & Multi-Language**: Each user selects their preferred target language (`/translate lang es/en/fr/de...`).
 
 ---
 
@@ -195,6 +225,19 @@ docker run --env-file .env musicbot
 | `/recommend` | Get personalized song recommendations |
 | `/ping` | Check bot latency |
 | `/cookies` | Check YouTube cookie status (owners only) |
+
+### Translation slash commands (`/translate`)
+
+| Command | Description |
+|---|---|
+| `/translate join` | Join voice channel and start real-time voice translation |
+| `/translate leave` | Stop voice translation and leave voice channel |
+| `/translate lang <code` | Set your target listening language (e.g. `es`, `en`, `fr`, `de`, `ja`) |
+| `/translate status` | View active translation session status & participant target languages |
+| `/translate glossary_add <orig> <corr>` | Add custom translation correction rule to your personal profile |
+| `/translate glossary_list` | List custom corrections in your personal glossary |
+| `/translate history` | View your recent translation history |
+| `/translate voices <lang>` | List available edge-tts neural voices for a language |
 
 ### Voice commands (after `/listen`)
 
@@ -302,3 +345,4 @@ pm2 startup && pm2 save
 - **Linux / Oracle Cloud** — server setup, SSH, process management
 - **PM2** — production process management, auto-restart, logging
 - **Software Architecture** — pipeline design, separation of concerns
+- **Speech-to-Speech Translation** — real-time STT -> Translation -> TTS pipeline, adaptive learning layer with prompt biasing & custom glossary
