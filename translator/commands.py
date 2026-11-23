@@ -21,6 +21,10 @@ from discord.ext import commands
 from discord import app_commands
 
 from translator import manager
+from utils.voice_session_manager import (
+    VoiceClientUpgradeBlockedError,
+    VoiceReceiveUnavailableError,
+)
 from translator.profile import (
     SUPPORTED_LANGUAGES,
     get_lang_name,
@@ -70,10 +74,15 @@ class TranslatorCog(commands.Cog, name="Translator"):
         settings = await get_user_settings(interaction.user.id)
         target_lang = settings.get("target_lang", "es")
 
-        await session.start(
-            voice_channel=interaction.user.voice.channel,
-            text_channel_id=interaction.channel_id,
-        )
+        try:
+            await session.start(
+                voice_channel=interaction.user.voice.channel,
+                text_channel_id=interaction.channel_id,
+            )
+        except (VoiceReceiveUnavailableError, VoiceClientUpgradeBlockedError) as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
         session.add_user(interaction.user.id)
 
         lang_name = get_lang_name(target_lang)

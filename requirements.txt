@@ -4,7 +4,8 @@
 # ============================================================
 
 # ── Discord ─────────────────────────────────────────────────
-discord.py[voice]>=2.3.2        # discord.py con soporte de voz (AudioSink)
+discord.py[voice]==2.5.2        # discord.py fijado y probado
+discord-ext-voice-recv==0.4.2a145  # Extensión AudioSink / VoiceRecvClient fijada (ARM64 probado)
 
 # ── Transcripción de voz ─────────────────────────────────────
 openai-whisper>=20231117        # Whisper local (motor principal, gratis)

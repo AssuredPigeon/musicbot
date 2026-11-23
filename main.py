@@ -1,27 +1,30 @@
-#main punto de entrada principal
-import logging  #Modulo estandar para registrar log (mensajes de informacion, advertencia, etc)
-import asyncio  #Para manejar las operaciones asincronas (nos sirve para que la espera de multiples eventos que espera)
-from modules.bot_client import bot #Importamos el cliente principal del bot desde el modulo
-import config #importamos la configuracion del bot
-from utils.error_handler import setup_logging, log_exception #Son funciones personalizadas para configurar el sistema de logs.
-from modules.transcription_server import start_transcription_server
-from modules.music_player import MusicPlayer
-from modules.auto_messages import AutoMessageSystem  # Importamos el sistema de mensajes automáticos
+# main.py — punto de entrada principal
+import asyncio
+import logging
+
+import config
 from data.database import init_orm
-from tortoise import Tortoise 
+from modules.bot_client import (
+    auto_message_system,
+    bot,
+    music_player,
+    voice_command_handler,
+)
+from modules.transcription_server import start_transcription_server
+from tortoise import Tortoise
+from utils.error_handler import log_exception, setup_logging
+from utils.stt_queue import stt_queue_manager
+from utils.voice_session_manager import voice_session_manager
 
-music_player = MusicPlayer(bot)  # Crea instancia de tu reproductor de música
 # Configurar logging
-setup_logging() #LLamamos a la funcion para configurar el formato y nivel del archivo logs.
-logger = logging.getLogger('musicbot')  #crea el logger para registrar los eventos relacionados al bot
+setup_logging()
+logger = logging.getLogger('musicbot')
 
-# Inicializar el sistema de mensajes automáticos
-auto_message_system = AutoMessageSystem(bot)
+# Iniciar el servidor Flask interno (127.0.0.1:5050) con la instancia única de MusicPlayer y VoiceCommandHandler
+start_transcription_server(bot, music_player, voice_command_handler)
 
-# Iniciar el servidor Flask en segundo plano
-start_transcription_server(bot, music_player)
 
-async def main(): #funcion principal para inicializar al bot
+async def main():
     try:
         logger.info("Iniciando MusicBot...")
 
@@ -32,13 +35,32 @@ async def main(): #funcion principal para inicializar al bot
         await auto_message_system.load_auto_messages()
 
         # Iniciar el bot
-        await bot.start(config.BOT_TOKEN) #Inicia el bot con su token. Corre hasta que el bot se detiene.
+        await bot.start(config.BOT_TOKEN)
     except Exception as e:
-        log_exception("Error crítico en el bot", e) #si hay alguna excepcion se registra con un mensaje
-    finally:  #Nos aseguramos que el bot se cierre correctamente si no esta cerrado
-        # Cerrar correctamente al terminar
+        log_exception("Error crítico en el bot", e)
+    finally:
+        # Protocolo de apagado ordenado en 4 pasos antes de cerrar el event loop:
+        voice_session_manager.begin_closing()
+
+        # Cierre limpio de la cola/executor STT antes de cerrar conexiones
+        try:
+            shutdown_res = await stt_queue_manager.shutdown(timeout=10.0)
+            logger.info("Resultado de cierre STTQueueManager: %s", shutdown_res)
+        except Exception as e:
+            log_exception("Error cerrando STTQueueManager", e)
+
+        try:
+            await music_player.cleanup()
+        except Exception as e:
+            log_exception("Error limpiando MusicPlayer", e)
+
+        try:
+            await voice_session_manager.aclose(timeout=5.0)
+        except Exception as e:
+            log_exception("Error drenando VoiceSessionManager", e)
+
         if not bot.is_closed():
-            await bot.close() #lo cierra
+            await bot.close()
 
         try:
             await Tortoise.close_connections()
@@ -46,12 +68,12 @@ async def main(): #funcion principal para inicializar al bot
         except Exception as e:
             log_exception("Error al cerrar la conexión ORM", e)
 
-if __name__ == "__main__": #Nos aseguramos que el bloque se ejecute cuando el archivo se ejecuta directamente (si se importa no funciona)
+
+if __name__ == "__main__":
     try:
-        # Ejecutar el bucle de eventos principal
-        asyncio.run(main()) #Lanza a la funcion main() dentro del bucle de eventos
-    except KeyboardInterrupt: #Detectamos si el usuario presiona Ctrl+C para detener al bot manualmente
+        asyncio.run(main())
+    except KeyboardInterrupt:
         logger.info("Bot detenido manualmente")
     except Exception as e:
-        log_exception("Error fatal", e) #Captura cualquier otra excepcion y se registra y finaliza el programa con exit(1)
+        log_exception("Error fatal", e)
         exit(1)

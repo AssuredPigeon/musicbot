@@ -30,6 +30,9 @@ OWNER_ID = [517134072980439042, 374758259904610304]
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')   # Vacío = API desactivada
 WHISPER_USE_API = os.getenv('WHISPER_USE_API', 'false').lower() == 'true'
 
+# Token requerido para el endpoint HTTP interno /transcription (fail-closed si está vacío)
+TRANSCRIPTION_API_TOKEN = os.getenv('TRANSCRIPTION_API_TOKEN', '')
+
 # Configuraciones para Vosk
 VOSK_MODEL_PATH = "models/vosk-model-es-0.42"
 VOSK_SAMPLE_RATE = 16000  # Vosk funciona mejor con 16kHz

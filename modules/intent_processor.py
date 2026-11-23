@@ -67,6 +67,12 @@ class IntentProcessor:
         # Precompliar expresiones regulares
         for intent_name, intent_data in self.intents.items():
             intent_data["compiled"] = [re.compile(pattern, re.IGNORECASE) for pattern in intent_data["patterns"]]
+
+        # Guarda contra negaciones explícitas al inicio (evita ejecutar comandos negados en Bloque 0A)
+        self._negation_guard = re.compile(
+            r"^\s*(?:no|nunca|jam[aá]s)\b(?:\s+\w+){0,3}\s+(?:reproduc\w*|pong\w*|pon|play|escuch\w*|toc\w*|paus\w*|salt\w*|skip|cambi\w*|termin\w*|deten\w*|sub\w*|baj\w*)\b",
+            re.IGNORECASE,
+        )
     
     async def process_text(self, text):
         """
@@ -84,6 +90,13 @@ class IntentProcessor:
         try:
             # Normalizar texto
             text = text.lower().strip()
+
+            if self._negation_guard.search(text):
+                logger.debug(f"Frase negada ignorada por guarda inicial: '{text}'")
+                return {
+                    "intent": "unknown",
+                    "entities": []
+                }
             
             # Verificar cada intención
             for intent_name, intent_data in self.intents.items():
@@ -117,15 +130,18 @@ class IntentProcessor:
                         }
             
             # Si llegamos aquí, no se detectó ninguna intención específica
-            # Verificar si hay palabras clave de música para asumir que es play_song
-            if any(keyword in text for keyword in config.TRIGGER_KEYWORDS):
-                # Eliminar palabras clave para obtener el nombre de la canción
+            # Verificar si hay palabras clave de música (con límites de palabra) para asumir play_song
+            keyword_hits = [
+                kw for kw in config.TRIGGER_KEYWORDS
+                if re.search(r"\b" + re.escape(kw) + r"\b", text, re.IGNORECASE)
+            ]
+            if keyword_hits:
                 song_name = text
-                for keyword in config.TRIGGER_KEYWORDS:
-                    song_name = song_name.replace(keyword, "")
-                
-                song_name = song_name.strip()
-                
+                for keyword in keyword_hits:
+                    song_name = re.sub(r"\b" + re.escape(keyword) + r"\b", "", song_name, flags=re.IGNORECASE)
+
+                song_name = re.sub(r"\s+", " ", song_name).strip()
+
                 if song_name:
                     logger.debug(f"Asumiendo intención play_song para: '{text}'")
                     return {

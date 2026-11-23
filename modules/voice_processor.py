@@ -2,61 +2,47 @@
 #
 # Pipeline de transcripción de audio.
 #
-# Motor primario : Whisper local  (siempre disponible, gratis)
-# Motor fallback : OpenAI API     (activado via WHISPER_USE_API=true en .env)
+# Motor primario : Cola STT centralizada (utils/stt_queue.py) con instancia única lazy de Whisper
+# Motor fallback : OpenAI API (activado via WHISPER_USE_API=true en .env)
 #
 # Flujo:
-#   1.  smart_record_audio() → WAV 16kHz mono
-#   2.  transcribe_audio()   → texto
-#   3.  IntentProcessor      → intent + entities
+#   1. smart_record_audio() -> WAV 16kHz mono
+#   2. transcribe_audio()   -> STTQueueManager -> texto
+#   3. IntentProcessor      -> intent + entities
+
+from __future__ import annotations
 
 import os
 import logging
-import asyncio
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
 import config
 from utils.error_handler import log_exception
+from utils.stt_queue import STTStatus, stt_queue_manager
 from modules.intent_processor import IntentProcessor
 
 logger = logging.getLogger('musicbot.voice')
 
-# Executor para operaciones CPU-intensivas (Whisper local)
-executor = ThreadPoolExecutor(max_workers=2)
-
 intent_processor = IntentProcessor()
 
-# ──────────────────────────────────────────────────────────────
-# Carga condicional de motores
-# ──────────────────────────────────────────────────────────────
+_VOICE_COMMANDS_PROMPT = "Reproduce, pausa, salta, detén, volumen, cola, ayuda."
 
-_whisper_local_model = None
+_INVALID_TRANSCRIPTIONS = {
+    "", "gracias", "thank you", "thanks", "música", "music",
+    "subtítulos realizados por la comunidad de amara.org",
+    "suscríbete al canal", "subtitles by the amara.org community",
+}
+
 _openai_client = None
-
-def _load_local_whisper():
-    """Carga el modelo Whisper local en memoria (solo una vez)."""
-    global _whisper_local_model
-    if _whisper_local_model is None:
-        try:
-            import whisper as _whisper
-            logger.info(f"Cargando modelo Whisper local '{config.WHISPER_MODEL_SIZE}'...")
-            _whisper_local_model = _whisper.load_model(config.WHISPER_MODEL_SIZE)
-            logger.info("Modelo Whisper local cargado.")
-        except ImportError:
-            logger.error("openai-whisper no está instalado. Instálalo con: pip install openai-whisper")
-        except Exception as e:
-            logger.error(f"No se pudo cargar el modelo Whisper local: {e}")
-    return _whisper_local_model
 
 
 def _load_openai_client():
-    """Carga el cliente de OpenAI para la API (solo una vez)."""
+    """Carga el cliente de OpenAI para la API (solo una vez, bajo demanda)."""
     global _openai_client
     if _openai_client is None:
         api_key = config.OPENAI_API_KEY
         if not api_key:
-            logger.warning("OPENAI_API_KEY no definida. El fallback de API no estará disponible.")
+            logger.warning("OPENAI_API_KEY no definida. El modo API no estará disponible.")
             return None
         try:
             from openai import AsyncOpenAI
@@ -69,44 +55,37 @@ def _load_openai_client():
     return _openai_client
 
 
-# Carga al importar el módulo según configuración
-if config.WHISPER_USE_API:
-    logger.info("Modo transcripción: OpenAI API (WHISPER_USE_API=true)")
-    _load_openai_client()
-else:
-    logger.info("Modo transcripción: Whisper local")
-    _load_local_whisper()
-
-
-# ──────────────────────────────────────────────────────────────
-# Transcripción
-# ──────────────────────────────────────────────────────────────
-
-async def _transcribe_with_local(audio_path: str, language: str = "es") -> str | None:
+async def _transcribe_with_local(
+    audio_path: str,
+    language: str = "es",
+    is_cancelled_cb: Callable[[], bool] | None = None,
+) -> str | None:
     """
-    Transcribe con el modelo Whisper local en un thread separado
-    para no bloquear el event loop.
+    Transcribe usando el administrador centralizado STTQueueManager (instancia única lazy).
     """
-    model = _load_local_whisper()
-    if model is None:
-        return None
+    result = await stt_queue_manager.transcribe(
+        audio_path,
+        language=language,
+        task="transcribe",
+        initial_prompt=_VOICE_COMMANDS_PROMPT,
+        hallucination_set=_INVALID_TRANSCRIPTIONS,
+        min_chars=3,
+        is_cancelled_cb=is_cancelled_cb,
+    )
 
-    def _run():
-        result = model.transcribe(
-            audio_path,
-            language=language,
-            # Prompt inicial para mejorar la detección de comandos en español
-            initial_prompt="Reproduce, pausa, salta, detén, volumen, cola, ayuda.",
-            fp16=False,  # Más compatible en CPU
-        )
-        return result["text"].strip()
+    if result.status == STTStatus.OK:
+        return result.text
 
-    try:
-        text = await asyncio.get_event_loop().run_in_executor(executor, _run)
-        return text if text else None
-    except Exception as e:
-        log_exception("Error en transcripción local", e)
-        return None
+    if result.status in (
+        STTStatus.DROPPED_QUEUE_FULL,
+        STTStatus.DROPPED_STALE,
+        STTStatus.DROPPED_CANCELLED,
+        STTStatus.DROPPED_OVERLOAD,
+    ):
+        logger.info("Transcripción descartada por cola STT (%s): %s", result.status.value, result.error or "")
+    elif result.status == STTStatus.ERROR:
+        logger.error("Error STT local: %s", result.error)
+    return None
 
 
 async def _transcribe_with_api(audio_path: str, language: str = "es") -> str | None:
@@ -124,7 +103,7 @@ async def _transcribe_with_api(audio_path: str, language: str = "es") -> str | N
                 model="whisper-1",
                 file=audio_file,
                 language=language,
-                prompt="Reproduce, pausa, salta, detén, volumen, cola, ayuda.",
+                prompt=_VOICE_COMMANDS_PROMPT,
             )
         text = response.text.strip()
         return text if text else None
@@ -133,11 +112,15 @@ async def _transcribe_with_api(audio_path: str, language: str = "es") -> str | N
         return None
 
 
-async def transcribe_audio(audio_path: str, language: str = "es") -> str | None:
+async def transcribe_audio(
+    audio_path: str,
+    language: str = "es",
+    is_cancelled_cb: Callable[[], bool] | None = None,
+) -> str | None:
     """
     Selecciona el motor de transcripción según configuración:
-      - WHISPER_USE_API=false → Whisper local
-      - WHISPER_USE_API=true  → OpenAI API (con fallback a local si falla)
+      - WHISPER_USE_API=false -> STTQueueManager (Whisper local único)
+      - WHISPER_USE_API=true  -> OpenAI API (con fallback a STTQueueManager local si falla)
     """
     if not os.path.exists(audio_path):
         logger.warning(f"Archivo de audio no encontrado: {audio_path}")
@@ -148,29 +131,15 @@ async def transcribe_audio(audio_path: str, language: str = "es") -> str | None:
         text = await _transcribe_with_api(audio_path, language)
         if text:
             return text
-        # Fallback a local si la API falla
-        logger.warning("API falló, intentando con Whisper local como fallback...")
-        return await _transcribe_with_local(audio_path, language)
+        logger.warning("API falló, intentando con cola STT local como fallback...")
+        return await _transcribe_with_local(audio_path, language=language, is_cancelled_cb=is_cancelled_cb)
 
-    logger.debug("Usando Whisper local para transcripción.")
-    return await _transcribe_with_local(audio_path, language)
+    logger.debug("Usando STTQueueManager local para transcripción.")
+    return await _transcribe_with_local(audio_path, language=language, is_cancelled_cb=is_cancelled_cb)
 
 
-# ──────────────────────────────────────────────────────────────
-# Filtros de calidad de transcripción
-# ──────────────────────────────────────────────────────────────
-
-# Texto que Whisper genera cuando no hay audio o hay ruido de fondo
-_INVALID_TRANSCRIPTIONS = {
-    "", "gracias", "thank you", "thanks", "música", "music",
-    "subtítulos realizados por la comunidad de amara.org",
-    "suscríbete al canal", "subtitles by the amara.org community",
-}
-
-def _is_valid_transcription(text: str) -> bool:
-    """
-    Filtra transcripciones vacías o alucinaciones comunes de Whisper.
-    """
+def _is_valid_transcription(text: str | None) -> bool:
+    """Filtra transcripciones vacías o alucinaciones comunes de Whisper."""
     if not text:
         return False
     cleaned = text.lower().strip(" .,!?")
@@ -182,39 +151,39 @@ def _is_valid_transcription(text: str) -> bool:
     return True
 
 
-# ──────────────────────────────────────────────────────────────
-# Función principal del pipeline
-# ──────────────────────────────────────────────────────────────
-
-async def process_audio_file(audio_path: str, user_id: int) -> dict | None:
+async def process_audio_file(
+    audio_path: str,
+    user_id: int,
+    is_cancelled_cb: Callable[[], bool] | None = None,
+) -> dict | None:
     """
-    Pipeline completo: archivo WAV → transcripción → intent + entities.
-
-    Returns:
-        dict con keys "transcription", "intent", "entities" o None si falla.
+    Pipeline completo: archivo WAV -> STTQueueManager -> intent + entities.
     """
     if not os.path.exists(audio_path):
         logger.warning(f"Archivo de audio no encontrado: {audio_path}")
         return None
 
     try:
-        transcription = await transcribe_audio(audio_path)
+        transcription = await transcribe_audio(audio_path, is_cancelled_cb=is_cancelled_cb)
 
-        # Limpiar archivo temporal
         try:
             os.remove(audio_path)
         except Exception:
             pass
+
+        if is_cancelled_cb is not None and is_cancelled_cb():
+            logger.info("Comando descartado para usuario %s: sesión cancelada.", user_id)
+            return None
 
         if not _is_valid_transcription(transcription):
             logger.info(f"Transcripción inválida o vacía para {user_id}: '{transcription}'")
             return None
 
         logger.info(f"[Usuario {user_id}] Transcripción: '{transcription}'")
-
-        # Detectar intención y entidades
         intent_result = await intent_processor.process_text(transcription)
-        logger.info(f"[Usuario {user_id}] Intent: {intent_result['intent']} | Entities: {intent_result['entities']}")
+        logger.info(
+            f"[Usuario {user_id}] Intent: {intent_result['intent']} | Entities: {intent_result['entities']}"
+        )
 
         return {
             "transcription": transcription,
@@ -227,21 +196,19 @@ async def process_audio_file(audio_path: str, user_id: int) -> dict | None:
         return None
 
 
-async def capture_and_process_voice(user_id: int, guild_id: int, voice_receiver) -> tuple | None:
-    """
-    Captura voz real usando el VoiceReceiver y la procesa con Whisper.
-
-    Returns:
-        (transcription, intent, entities) o None si no hubo voz reconocible.
-    """
+async def capture_and_process_voice(
+    user_id: int,
+    guild_id: int,
+    voice_receiver,
+    is_cancelled_cb: Callable[[], bool] | None = None,
+) -> tuple | None:
+    """Captura voz real usando el VoiceReceiver y la procesa con la cola STT única."""
     try:
         audio_path = await voice_receiver.smart_record_audio(user_id)
-
         if not audio_path:
             return None
 
-        result = await process_audio_file(audio_path, user_id)
-
+        result = await process_audio_file(audio_path, user_id, is_cancelled_cb=is_cancelled_cb)
         if not result:
             return None
 

@@ -18,6 +18,7 @@ from modules import dev_commands
 from modules import ticket_system
 from tortoise import Tortoise
 from utils.cookie_manager import CookieMonitor, check_cookies_health
+from utils.stt_queue import stt_queue_manager
 
 # Configurar logger
 logger = logging.getLogger('musicbot.client') #creamos el logger especifico para separar logs por modulos
@@ -79,12 +80,12 @@ async def on_ready():
         log_exception("Error al sincronizar comandos slash", e)
 
     await music_player.start_cleanup_task()
+    stt_queue_manager.start(bot.loop)
 
-    # Registrar VoiceCommandHandler en el MusicPlayer
-    # Esto conecta el pipeline de voz: AudioSink → Whisper → IntentProcessor → MusicPlayer
-    voice_handler = VoiceCommandHandler(bot, music_player)
-    music_player.register_voice_command_handler(voice_handler)
-    logger.info("VoiceCommandHandler registrado en MusicPlayer")
+    # Registrar la instancia única de VoiceCommandHandler en el MusicPlayer
+    # Esto conecta el pipeline de voz: AudioSink -> Whisper (cola única) -> IntentProcessor -> MusicPlayer
+    music_player.register_voice_command_handler(voice_command_handler)
+    logger.info("VoiceCommandHandler único registrado en MusicPlayer")
 
     # Verificar estado de cookies de YouTube al arrancar
     cookie_health = check_cookies_health(config.COOKIES_PATH)
@@ -163,7 +164,7 @@ async def play(ctx, *, query):
         voice_channel = ctx.author.voice.channel
         
         # Unirse al canal si no lo está ya
-        if not music_player.is_connected():
+        if not music_player.is_connected(ctx.guild.id):
             await music_player.join_voice_channel(voice_channel)
             
         # Procesar y reproducir
@@ -182,10 +183,11 @@ async def listen(ctx):
             return
             
         guild_id = ctx.guild.id
+        voice_channel = ctx.author.voice.channel
 
         # Unirse al canal si no lo está ya
         if not music_player.is_connected(guild_id):
-            await music_player.join_voice_channel(voice_channel)
+            await music_player.join_voice_channel(voice_channel, require_receive=True)
 
         # Guardar el canal de texto donde se activó la escucha (para responder aquí)
         music_player.set_voice_text_channel(guild_id, ctx.channel.id)
@@ -204,7 +206,10 @@ async def listen(ctx):
 async def stop_listen(ctx):
     """Detiene el modo de escucha para comandos de voz"""
     try:
-        response = await music_player.stop_voice_command_mode()
+        response = await music_player.stop_voice_command_mode(
+            guild_id=ctx.guild.id if ctx.guild else None,
+            user_id=ctx.author.id,
+        )
         await ctx.send(response)
     except Exception as e:
         log_exception("Error en comando stop_listen", e)
@@ -214,7 +219,7 @@ async def stop_listen(ctx):
 async def skip(ctx):
     """Saltar a la siguiente canción"""
     try:
-        response = await music_player.skip()
+        response = await music_player.skip(guild_id=ctx.guild.id if ctx.guild else None)
         await ctx.send(response)
     except Exception as e:
         log_exception("Error en comando skip", e)
@@ -224,7 +229,7 @@ async def skip(ctx):
 async def stop(ctx):
     """Detener reproducción y desconectar"""
     try:
-        response = await music_player.stop()
+        response = await music_player.stop(guild_id=ctx.guild.id if ctx.guild else None)
         await ctx.send(response)
     except Exception as e:
         log_exception("Error en comando stop", e)
@@ -297,7 +302,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
         
         # Unirse al canal si no lo está ya
-        if not music_player.is_connected():
+        if not music_player.is_connected(interaction.guild_id):
             await music_player.join_voice_channel(voice_channel)
             
         # Procesar y reproducir
@@ -315,7 +320,7 @@ async def slash_skip(interaction: discord.Interaction):
     """Comando slash para saltar la canción actual"""
     try:
         await interaction.response.defer(thinking=True)
-        response = await music_player.skip()
+        response = await music_player.skip(guild_id=interaction.guild_id)
         await interaction.followup.send(response)
     except Exception as e:
         log_exception("Error en comando slash skip", e)
@@ -326,7 +331,7 @@ async def slash_stop(interaction: discord.Interaction):
     """Comando slash para detener la reproducción"""
     try:
         await interaction.response.defer(thinking=True)
-        response = await music_player.stop()
+        response = await music_player.stop(guild_id=interaction.guild_id)
         await interaction.followup.send(response)
     except Exception as e:
         log_exception("Error en comando slash stop", e)
@@ -365,7 +370,7 @@ async def slash_listen(interaction: discord.Interaction):
 
         # Unirse al canal si no lo está ya
         if not music_player.is_connected(guild_id):
-            await music_player.join_voice_channel(voice_channel)
+            await music_player.join_voice_channel(voice_channel, require_receive=True)
 
         # Guardar el canal de texto donde se activó la escucha (para responder aquí)
         music_player.set_voice_text_channel(guild_id, interaction.channel_id)
@@ -385,7 +390,10 @@ async def slash_stop_listen(interaction: discord.Interaction):
     """Comando slash para detener escucha de voz"""
     try:
         await interaction.response.defer(thinking=True)
-        response = await music_player.stop_voice_command_mode()
+        response = await music_player.stop_voice_command_mode(
+            guild_id=interaction.guild_id,
+            user_id=interaction.user.id,
+        )
         await interaction.followup.send(response)
     except Exception as e:
         log_exception("Error en comando slash stop_listen", e)
@@ -1667,6 +1675,7 @@ async def handle_voice_command(user_id, transcription, intent, entities):
     except Exception as e:
         log_exception("Error al procesar comando de voz", e)
 
-# Registrar el handler en el reproductor de música
+# Registrar instancia única de handler en el reproductor de música
 voice_command_handler = VoiceCommandHandler(bot, music_player)
-music_player.register_voice_command_handler(handle_voice_command)
+music_player.register_voice_command_handler(voice_command_handler)
+music_player.register_voice_command_handler(voice_command_handler)

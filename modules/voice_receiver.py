@@ -15,11 +15,19 @@ import wave
 import struct
 import asyncio
 import tempfile
+import threading
 import logging
 import numpy as np
 import discord
 
 from utils.audio_utils import detect_voice_activity, save_audio_to_file
+from utils.voice_session_manager import (
+    AudioSinkBase,
+    HAS_VOICE_RECV,
+    VoiceDataType,
+    VoiceReceiveUnavailableError,
+    voice_session_manager,
+)
 
 logger = logging.getLogger('musicbot.voice_receiver')
 
@@ -27,34 +35,48 @@ logger = logging.getLogger('musicbot.voice_receiver')
 # AudioSink: recibe los paquetes PCM de Discord por usuario
 # ──────────────────────────────────────────────────────────────
 
-class DiscordAudioSink(discord.AudioSink):
+class DiscordAudioSink(AudioSinkBase):
     """
     Sink que acumula paquetes PCM 48 kHz / stereo / int16 por user_id.
-    discord.py llama a write() cada vez que llega un paquete de voz.
+    discord-ext-voice-recv llama a write() cada vez que llega un paquete de voz.
     """
 
     def __init__(self):
+        super().__init__()
         self._buffers: dict[int, bytearray] = {}  # {user_id: raw_pcm_bytes}
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
+        self._cleaned_up = False
 
-    def write(self, user: discord.User | None, data: discord.AudioFrame) -> None:
-        if user is None:
+    def write(self, user: discord.User | None, data: VoiceDataType) -> None:
+        if user is None or self._cleaned_up:
+            return
+        pcm = getattr(data, "pcm", None)
+        if pcm is None:
+            pcm = getattr(data, "data", None)
+        if not pcm:
             return
         uid = user.id
-        if uid not in self._buffers:
-            self._buffers[uid] = bytearray()
-        self._buffers[uid].extend(data.data)
+        with self._lock:
+            if self._cleaned_up:
+                return
+            if uid not in self._buffers:
+                self._buffers[uid] = bytearray()
+            self._buffers[uid].extend(pcm)
 
     def wants_opus(self) -> bool:
         # Queremos PCM decodificado, no Opus crudo
         return False
 
     def cleanup(self) -> None:
-        self._buffers.clear()
+        with self._lock:
+            if self._cleaned_up:
+                return
+            self._cleaned_up = True
+            self._buffers.clear()
 
     async def get_audio(self, user_id: int) -> bytes | None:
         """Retorna y limpia el buffer acumulado de un usuario."""
-        async with self._lock:
+        with self._lock:
             data = self._buffers.pop(user_id, None)
             return bytes(data) if data else None
 
@@ -79,36 +101,76 @@ class VoiceReceiver:
     DISCORD_CHANNELS = 2
     BYTES_PER_SAMPLE = 2  # int16
 
-    def __init__(self, voice_client: discord.VoiceClient | None = None, sample_rate: int = 48_000):
+    def __init__(
+        self,
+        voice_client: discord.VoiceClient | None = None,
+        sample_rate: int = 48_000,
+        guild_id: int | None = None,
+        on_revoked=None,
+    ):
         self.voice_client = voice_client
+        self.guild_id = guild_id or getattr(getattr(voice_client, "guild", None), "id", None)
         self.sample_rate = sample_rate          # tasa de entrada de Discord
         self.whisper_sample_rate = 16_000       # Whisper espera 16 kHz
         self.temp_dir = tempfile.gettempdir()
         self._sink: DiscordAudioSink | None = None
+        self._session_token: int | None = None
+        self._on_revoked = on_revoked
 
     # ── Ciclo de vida ──────────────────────────────────────────
 
     async def setup_receiver(self):
-        """Instala el AudioSink en el VoiceClient activo."""
+        """Instala el AudioSink en el VoiceRecvClient activo via VoiceSessionManager."""
+        if not HAS_VOICE_RECV:
+            raise VoiceReceiveUnavailableError(
+                "discord-ext-voice-recv no está disponible; recepción de audio deshabilitada."
+            )
         if self.voice_client is None:
             logger.warning("setup_receiver: no hay VoiceClient disponible todavía.")
             return
 
+        guild_id = self.guild_id or getattr(getattr(self.voice_client, "guild", None), "id", None)
         self._sink = DiscordAudioSink()
         try:
-            self.voice_client.listen(self._sink)
+            if guild_id is not None:
+                self._session_token = await voice_session_manager.acquire_sink(
+                    guild_id=guild_id,
+                    voice_client=self.voice_client,
+                    owner_mode="voice_commands",
+                    sink=self._sink,
+                    on_revoked=self._handle_revoked,
+                )
+            else:
+                self.voice_client.listen(self._sink)
             logger.info("AudioSink instalado correctamente en el VoiceClient.")
         except Exception as e:
             logger.error(f"No se pudo instalar el AudioSink: {e}")
+            self._sink.cleanup()
             self._sink = None
+            self._session_token = None
+            raise
 
-    async def cleanup(self):
-        """Detiene la captura y libera recursos."""
-        if self.voice_client and self.voice_client.is_listening():
-            self.voice_client.stop_listening()
+    def _handle_revoked(self):
+        """Llamado por VoiceSessionManager si otra sesión (ej. /translate) toma el sink."""
+        self._session_token = None
         if self._sink:
             self._sink.cleanup()
             self._sink = None
+        if callable(self._on_revoked):
+            self._on_revoked()
+
+    async def cleanup(self):
+        """Detiene la captura y libera recursos de forma aislada e idempotente."""
+        guild_id = self.guild_id or getattr(getattr(self.voice_client, "guild", None), "id", None)
+        if guild_id is not None and self._session_token is not None:
+            token = self._session_token
+            self._session_token = None
+            voice_session_manager.release_sink(guild_id, token, self.voice_client)
+        elif self._sink:
+            if self.voice_client and getattr(self.voice_client, "is_listening", lambda: False)():
+                self.voice_client.stop_listening()
+            self._sink.cleanup()
+        self._sink = None
 
     # Alias requeridos por el resto del código
     async def start_recording(self, user_id: int):

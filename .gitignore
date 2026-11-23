@@ -73,8 +73,9 @@ Thumbs.db
 # --- PM2 (si tienes el ecosistema con datos sensibles) ---
 # musicbot_pm2.json  # Descomenta si contiene datos sensibles
 
-# --- Archivos comprimidos de desarrollo ---
+# --- Archivos comprimidos de desarrollo y respaldos de VM ---
 *.zip
+vm_backup/
 
 # --- Scripts: sí se incluyen en el repo ---
 # scripts/refresh_cookies.sh NO tiene secretos; el usuario configura
